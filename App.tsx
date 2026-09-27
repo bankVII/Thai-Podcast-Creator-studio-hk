@@ -271,6 +271,8 @@ export default function App() {
   const [showGuide, setShowGuide] = useState(false);
   const [autoPoll, setAutoPoll] = useState(true);
   const [pollCountdown, setPollCountdown] = useState(20);
+  const [polling, setPolling] = useState(false);
+  const [pollProgress, setPollProgress] = useState('');
   const [notificationsAllowed, setNotificationsAllowed] = useState(
     typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted'
   );
@@ -278,6 +280,7 @@ export default function App() {
   const scriptTextareaRef = useRef<HTMLTextAreaElement>(null);
   const stop = useRef(false);
   const running = useRef(false);
+  const pollInFlight = useRef(false);
   const prevAllDoneRef = useRef(false);
 
   const plan = useMemo(() => {
@@ -309,26 +312,71 @@ export default function App() {
     prevAllDoneRef.current = allDone;
   }, [allDone, session]);
 
+  const sessionRef = useRef(session);
+  sessionRef.current = session;
+
+  // One Batch check at a time: downloading a finished job can outlast the poll
+  // interval, and overlapping checks would download the same audio repeatedly.
+  const pollBatch = async (manual = false) => {
+    const current = sessionRef.current;
+    if (!current?.batch || pollInFlight.current) return;
+    if (running.current) {
+      if (manual) setError('ระบบกำลังทำงานอื่นอยู่ กรุณารอสักครู่แล้วกดตรวจอีกครั้ง');
+      return;
+    }
+    pollInFlight.current = true;
+    setPolling(true);
+    setPollProgress('');
+    if (manual) setError('');
+    // Copy only what a check changes; the stored audio chunks stay shared.
+    const working: PodcastSession = {
+      ...current,
+      batch: structuredClone(current.batch),
+      chunks: [...current.chunks],
+      charges: [...current.charges],
+    };
+    const check = () =>
+      collectBatch(working, save, undefined, {
+        progress: setPollProgress,
+        refresh: next => setSession(prev => (prev?.id === next.id ? { ...prev, batch: structuredClone(next.batch) } : prev)),
+      });
+    try {
+      if (navigator.locks) {
+        await navigator.locks.request('podcast-generation', { ifAvailable: true }, async lock => {
+          if (!lock) {
+            if (manual) setError('มีหน้าต่างอื่นกำลังทำงาน กรุณาใช้ทีละหน้าต่าง');
+            return;
+          }
+          await check();
+        });
+      } else {
+        await check();
+      }
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      pollInFlight.current = false;
+      setPolling(false);
+      setPollProgress('');
+    }
+  };
+
   // Background auto-polling for active Batch jobs: polls every 20 seconds and fetches audio automatically
   useEffect(() => {
     if (!activeBatch || !autoPoll) return;
+    let remaining = 20;
+    setPollCountdown(remaining);
     const interval = window.setInterval(() => {
-      setPollCountdown(prev => {
-        if (prev <= 1) {
-          if (!running.current && session) {
-            collectBatch(structuredClone(session), save)
-              .then(() => {
-                setError(current => (current && /readablestream|unexpected end of json|close/i.test(current) ? '' : current));
-              })
-              .catch(() => {});
-          }
-          return 20;
-        }
-        return prev - 1;
-      });
+      if (pollInFlight.current) return;
+      remaining -= 1;
+      if (remaining <= 0) {
+        remaining = 20;
+        if (!running.current) pollBatch();
+      }
+      setPollCountdown(remaining);
     }, 1000);
     return () => window.clearInterval(interval);
-  }, [activeBatch, autoPoll, session]);
+  }, [activeBatch, autoPoll]);
 
   const enableNotifications = async () => {
     const res = await requestNotificationPermission();
@@ -439,6 +487,10 @@ export default function App() {
 
   const run = async (operation: () => Promise<void>) => {
     if (running.current) return;
+    if (pollInFlight.current) {
+      setError('กำลังตรวจหรือดาวน์โหลดผล Batch อยู่ กรุณารอให้เสร็จแล้วกดอีกครั้ง');
+      return;
+    }
     running.current = true;
     setBusy(true);
     setError('');
@@ -527,7 +579,7 @@ export default function App() {
       try {
         await checkBatchConnection(settings.model);
         setBatchReady(true);
-        setBatchConnection('✅ โมเดลนี้พร้อมสำหรับงาน Batch API (ประหยัด 50%) — หมายเหตุ: คิว Batch ของ Google ใช้เวลาประมาณ 10-30 นาทีขึ้นไป หากต้องการเสียงด่วนในไม่กี่วินาที แนะนำให้ใช้ปุ่ม "สร้างทันที" แทน');
+        setBatchConnection('✅ โมเดลนี้พร้อมสำหรับงาน Batch API (ประหยัด 50%) — หมายเหตุ: Google ตั้งเป้าทำคิว Batch ให้เสร็จภายใน 24 ชั่วโมง (ส่วนใหญ่เร็วกว่านั้นมาก) หากต้องการเสียงด่วนในไม่กี่วินาที แนะนำให้ใช้ปุ่ม "สร้างทันที" แทน');
       } catch (e) {
         setBatchReady(false);
         setBatchConnection(`Batch ไม่พร้อมใช้งาน: ${errorMessage(e)} — สามารถใช้ปุ่มสร้างทันทีได้`);
@@ -1342,6 +1394,27 @@ export default function App() {
               </div>
             )}
 
+            {session?.batch &&
+              !activeBatch &&
+              ['JOB_STATE_FAILED', 'JOB_STATE_EXPIRED', 'JOB_STATE_PARTIALLY_SUCCEEDED'].includes(session.batch.state) && (
+                <div className="p-3.5 bg-amber-950/40 border border-amber-800/60 rounded-xl text-xs text-amber-200 flex items-start justify-between gap-3">
+                  <div className="flex items-start gap-2">
+                    <AlertTriangle size={16} className="text-amber-400 shrink-0 mt-0.5" />
+                    <div className="space-y-1">
+                      <p>{session.batch.checkMessage || `งาน Batch จบด้วยสถานะ ${session.batch.state}`}</p>
+                      {session.batch.lastError && <p className="text-amber-300/80">{session.batch.lastError}</p>}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleDismissBatch}
+                    className="text-amber-400 hover:text-amber-300 text-xs underline shrink-0 cursor-pointer"
+                  >
+                    ปิดแจ้งเตือน
+                  </button>
+                </div>
+              )}
+
             {activeBatch ? (
               <div className="p-5 bg-gradient-to-b from-indigo-950/60 via-zinc-900 to-zinc-950 border border-indigo-700/60 rounded-2xl space-y-4 shadow-xl shadow-indigo-950/20">
                 <div className="flex flex-wrap items-center justify-between gap-2 border-b border-indigo-800/40 pb-3">
@@ -1355,10 +1428,15 @@ export default function App() {
                       <p className="font-semibold text-zinc-100 text-sm">
                         {session!.batch!.state === 'JOB_STATE_RUNNING'
                           ? 'Google กำลังเรนเดอร์เสียง (JOB_STATE_RUNNING)'
-                          : 'มีงานในคิว Batch: รอคิวประมวลผล (JOB_STATE_PENDING)'}
+                          : session!.batch!.state === 'JOB_STATE_PENDING'
+                            ? 'มีงานในคิว Batch: รอคิวประมวลผล (JOB_STATE_PENDING)'
+                            : 'กำลังยืนยันการส่งงาน Batch กับ Google'}
+                        {session!.batch!.lastError && <span className="text-red-300"> · มีปัญหา (ดูข้อความสีแดง)</span>}
                       </p>
                       <p className="text-[11px] text-zinc-400 font-mono break-all">
-                        {session!.batch!.name || session!.batch!.displayName}
+                        {session!.batch!.jobs && session!.batch!.jobs.length > 1
+                          ? `${session!.batch!.jobs.length} งาน Batch (แบ่งทีละช่วงเพื่อให้ดาวน์โหลดผลได้ทุกความยาว)`
+                          : session!.batch!.jobs?.[0]?.name || session!.batch!.name || session!.batch!.displayName}
                       </p>
                     </div>
                   </div>
@@ -1380,7 +1458,10 @@ export default function App() {
                         ทำไมระบบ Batch ถึงรอนาน / เหมือนหมุนไม่หยุด?
                       </p>
                       <p className="text-[11px] text-zinc-400">
-                        Google Gemini Batch API (ส่วนลดค่าเสียง 50%) เป็นคิวงานแบบ <strong>Asynchronous</strong> โดย Google จะนำคำขอไปรันในช่วงที่เซิร์ฟเวอร์ว่าง ซึ่งปกติคิวจะใช้เวลาประมาณ <strong>10–30 นาทีขึ้นไป</strong> (ไม่ได้เกิดจากหน้าเว็บค้าง)
+                        Google Gemini Batch API (ส่วนลดค่าเสียง 50%) เป็นคิวงานแบบ <strong>Asynchronous</strong> Google ตั้งเป้าทำให้เสร็จ<strong>ภายใน 24 ชั่วโมง</strong> (ส่วนใหญ่เร็วกว่านั้นมาก แต่ไม่รับประกันเวลา) และงานที่ค้างเกิน 48 ชั่วโมงจะหมดอายุ ปิดหน้าเว็บได้ งานยังประมวลผลต่อที่ Google — เปิดแอปเดิมด้วย API key เดิมเพื่อดึงเสียง
+                      </p>
+                      <p className="text-[11px] text-zinc-400">
+                        ถ้ามีข้อความสีแดงด้านล่าง แปลว่าการตรวจกับ Google มีปัญหาจริง (เช่น ไม่พบงาน หรือสิทธิ์ถูกปฏิเสธ) ไม่ใช่แค่รอคิว
                       </p>
                       <p className="text-[11px] text-cyan-300 font-medium pt-0.5">
                         ⚡ หากคุณต้องการฟังเสียงทันที ไม่จำเป็นต้องรอคิว สามารถกดปุ่ม <span className="underline">สลับไปสร้างเสียงทันที</span> ด้านล่างได้ทันที (เสร็จใน 5-15 วินาทีต่อช่วง)
@@ -1394,7 +1475,9 @@ export default function App() {
                   <div className="flex items-center gap-2 text-zinc-300">
                     <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping shrink-0" />
                     <span>
-                      {autoPoll ? (
+                      {polling ? (
+                        <>{pollProgress || 'กำลังตรวจสถานะกับ Google…'}</>
+                      ) : autoPoll ? (
                         <>ระบบตรวจและดึงไฟล์เสียงอัตโนมัติ: ในอีก <strong className="text-cyan-300 font-mono">{pollCountdown}s</strong></>
                       ) : (
                         <>ปิดการดึงเสียงอัตโนมัติอยู่ (ต้องกดตรวจเอง)</>
@@ -1437,6 +1520,21 @@ export default function App() {
                   </div>
                 )}
 
+                {session!.batch!.jobs && session!.batch!.jobs.length > 1 && (
+                  <details className="text-[11px] text-zinc-400 bg-zinc-950/60 p-3 rounded-xl border border-zinc-800">
+                    <summary className="cursor-pointer text-zinc-300">สถานะแยกตามงาน ({session!.batch!.jobs.length} งาน)</summary>
+                    <ul className="mt-2 space-y-1 font-mono">
+                      {session!.batch!.jobs.map((job, k) => (
+                        <li key={job.displayName} className="break-all">
+                          {k + 1}. ช่วง {job.indices.map(i => i + 1).join(', ')} · {job.collected ? 'ดึงเสียงแล้ว' : job.state}
+                          {job.name ? ` · ${job.name}` : ''}
+                          {job.lastError ? <span className="text-red-300"> · {job.lastError}</span> : null}
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
+                )}
+
                 {session!.batch!.lastError && (
                   <div className="p-3 bg-red-950/40 border border-red-900 rounded-xl text-red-300 text-xs flex items-start justify-between gap-2.5">
                     <div className="flex items-start gap-2">
@@ -1462,7 +1560,7 @@ export default function App() {
                 {/* Action Buttons */}
                 <div className="flex flex-wrap gap-2.5 pt-1">
                   <button
-                    disabled={busy}
+                    disabled={busy || polling}
                     className={`${button} bg-cyan-600 hover:bg-cyan-500 text-white font-medium flex items-center justify-center gap-1.5 shadow-lg shadow-cyan-950/40`}
                     onClick={handleCancelAndGenerateStandard}
                     title="ยกเลิกการรอคิว Batch แล้วเริ่มสร้างเสียงทันที (Real-time)"
@@ -1472,25 +1570,16 @@ export default function App() {
                   </button>
 
                   <button
-                    disabled={busy}
+                    disabled={busy || polling}
                     className={`${button} bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs py-2 flex items-center gap-1.5`}
-                    onClick={() =>
-                      run(async () => {
-                        setError('');
-                        if (session?.batch) {
-                          session.batch.lastError = undefined;
-                        }
-                        setStatus('กำลังตรวจสถานะคิวงาน Batch กับ Google…');
-                        await collectBatch(structuredClone(session!), save);
-                      })
-                    }
+                    onClick={() => pollBatch(true)}
                   >
-                    <RefreshCw size={13} className="inline" />
+                    <RefreshCw size={13} className={`inline ${polling ? 'animate-spin' : ''}`} />
                     <span>ตรวจสถานะคิว / ดึงเสียง</span>
                   </button>
 
                   <button
-                    disabled={busy}
+                    disabled={busy || polling}
                     className={`${button} bg-red-950/60 hover:bg-red-900/60 text-red-300 border border-red-800/60 text-xs py-2 flex items-center gap-1.5`}
                     onClick={handleCancelBatch}
                     title="ยกเลิกการรอคิวนี้และปลดล็อกปุ่มสร้างเสียง"

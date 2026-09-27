@@ -44,6 +44,20 @@ export interface AudioChunk {
   previousTake?: { pcm: Uint8Array; seconds: number; warnings?: string[] };
 }
 
+// One Google Batch job. A long episode is split into several jobs so that no
+// single status/result download has to carry the whole episode's audio.
+export interface BatchJobRecord {
+  name?: string;
+  displayName: string;
+  indices: number[];
+  state: string;
+  submittedAt?: number;
+  // True once this job's results were downloaded and stored in `chunks`.
+  collected?: boolean;
+  lastError?: string;
+  stats?: { total: number; succeeded: number; failed: number; pending: number };
+}
+
 export interface PodcastSession {
   version: 1;
   id: string;
@@ -52,13 +66,16 @@ export interface PodcastSession {
   chunks: AudioChunk[];
   charges: { mode: 'standard' | 'batch'; inputTokens?: number; audioTokens?: number; seconds?: number }[];
   batch?: {
+    // Legacy single-job sessions store the job here; newer sessions use `jobs`.
     name?: string;
     displayName: string;
     lastError?: string;
+    // Aggregate state across `jobs`.
     state: string;
     indices: number[];
     lastChecked?: string;
     checkMessage?: string;
+    jobs?: BatchJobRecord[];
   };
 }
 

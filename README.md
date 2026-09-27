@@ -9,7 +9,8 @@ Thai single- and two-speaker podcasts on Google AI Studio. Defaults remain Gemin
 - Regenerate one chunk, or experimentally repair it using 1,000-character requests. Short repair saves each successful part, resumes after interruption, and keeps the original take until completion. Restore the previous take without another API call.
 - Reset local job state while retaining the script and one previous-job backup.
 - Animated working indicator, elapsed time, saved-part progress and pause after the current request.
-- Batch submission gated by selected-model metadata and a read-only job-list check. Recover uncertain submissions by their unique display name instead of automatically submitting again.
+- Batch submission gated by selected-model metadata. Recover uncertain submissions by their unique display name instead of automatically submitting again.
+- Long episodes are submitted as several Batch jobs of about one chunk each. A finished job returns its audio inline in the job resource, so one job for a whole episode meant a single download of hundreds of MB that the browser could not complete. Status checks request only small fields; results are streamed and saved chunk by chunk. Check failures (for example 404 when the API key or project changed after submission) are shown as errors, not as "still queued". Google's target turnaround for Batch is 24 hours, and jobs not finished within 48 hours expire.
 
 ## Google AI Studio
 
@@ -46,6 +47,6 @@ npm run typecheck
 npm run build
 ```
 
-The 22 automated tests use mocked API responses, not paid synthesis. They cover Thai splitting, PCM/WAV integrity, persistence/resume, repair/restore, Batch recovery, model capability checks, and the original Standard request route. The production build has a bundle-size advisory.
+The automated tests use mocked API responses, not paid synthesis. They cover Thai splitting, request building, and the Batch flow against a fake REST API (job splitting, masked status polls, streamed results, legacy sessions, 404 reporting, interrupted downloads, partial submission, cancel). The production build has a bundle-size advisory.
 
 [Research and pricing notes](docs/google-tts-research-2026-09-11.md) are dated findings; availability must be checked against the actual connection.
