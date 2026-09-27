@@ -594,9 +594,13 @@ function httpStatus(error: unknown): number | undefined {
   }
 }
 
+// Google answers an unsupported mask with 400, but a proxy in front of the API
+// (for example the AI Studio host) may answer differently, so any client error
+// except rate limiting or a bad key moves on to the next, simpler request.
 function maskRejected(error: unknown): boolean {
   const raw = error instanceof Error ? error.message : String(error);
-  return httpStatus(error) === 400 && !/api.?key/i.test(raw);
+  const code = httpStatus(error);
+  return code !== undefined && code >= 400 && code < 500 && code !== 429 && !/api.?key/i.test(raw);
 }
 
 function timeText() {
@@ -651,13 +655,15 @@ function responsesFileOf(raw: any): string | undefined {
 async function fetchJobStatus(client: Client, name: string): Promise<any> {
   const api = rawApi(client);
   if (!api) return client.batches.get({ name });
-  for (;;) {
-    const fields = STATUS_MASKS[statusMaskLevel];
+  for (let level = statusMaskLevel; ; level++) {
+    const fields = STATUS_MASKS[level];
     try {
-      return await requestJson(api, { path: name, httpMethod: 'GET', ...(fields ? { queryParams: { fields } } : {}) });
+      const data = await requestJson(api, { path: name, httpMethod: 'GET', ...(fields ? { queryParams: { fields } } : {}) });
+      // Remember a simpler mask only once it has worked; a real 404 fails at every level.
+      statusMaskLevel = level;
+      return data;
     } catch (error) {
       if (!fields || !maskRejected(error)) throw error;
-      statusMaskLevel++;
     }
   }
 }

@@ -31,11 +31,15 @@ export class JsonArrayStreamer {
     return this.started && !this.stack.length && !this.inString;
   }
 
-  constructor(
-    private readonly targetKey: string,
-    private readonly onItem: (json: string) => void,
-    private readonly onString?: (key: string, value: string) => void,
-  ) {}
+  private readonly targetKey: string;
+  private readonly onItem: (json: string) => void;
+  private readonly onString?: (key: string, value: string) => void;
+
+  constructor(targetKey: string, onItem: (json: string) => void, onString?: (key: string, value: string) => void) {
+    this.targetKey = targetKey;
+    this.onItem = onItem;
+    this.onString = onString;
+  }
 
   push(text: string) {
     const n = text.length;
@@ -144,8 +148,11 @@ export class JsonArrayStreamer {
 // Splits streamed text into complete lines (for JSONL result files).
 export class LineStreamer {
   private parts: string[] = [];
+  private readonly onLine: (line: string) => void;
 
-  constructor(private readonly onLine: (line: string) => void) {}
+  constructor(onLine: (line: string) => void) {
+    this.onLine = onLine;
+  }
 
   push(text: string) {
     let start = 0;

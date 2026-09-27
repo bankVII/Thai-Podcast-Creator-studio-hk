@@ -63,6 +63,7 @@ export class FakeBatchApi {
   pieceSize = 7;
   truncateNextResult = false;
   rejectMasks: RegExp | null = null;
+  rejectMaskCode = 400;
   failCreateAt: number | null = null;
   notFound = new Set<string>();
   files = new Map<string, string>();
@@ -116,7 +117,7 @@ export class FakeBatchApi {
       const call: FakeCall = { ...req, bytes: 0 };
       this.calls.push(call);
       const fields = req.queryParams?.fields;
-      if (fields && this.rejectMasks?.test(fields)) throw apiError(400, 'INVALID_ARGUMENT', `Invalid field selector: ${fields}`);
+      if (fields && this.rejectMasks?.test(fields)) throw apiError(this.rejectMaskCode, this.rejectMaskCode === 400 ? 'INVALID_ARGUMENT' : 'NOT_FOUND', `Rejected field selector: ${fields}`);
       const reply = (data: unknown, truncate = false) => {
         const text = JSON.stringify(data);
         call.bytes = text.length;
