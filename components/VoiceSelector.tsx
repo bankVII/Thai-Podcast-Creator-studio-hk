@@ -30,7 +30,7 @@ export const VoiceSelector: React.FC<VoiceSelectorProps> = ({ speaker, onChange,
               value={speaker.name}
               onChange={(e) => onChange({ ...speaker, name: e.target.value })}
               className="w-full bg-black/20 border border-zinc-800 rounded-lg py-2 pl-9 pr-3 text-sm text-zinc-200 focus:outline-none focus:ring-1 focus:ring-indigo-500/50 focus:border-indigo-500/50 transition-all placeholder-zinc-600"
-              placeholder="e.g. Host, Guest, Narrator"
+              placeholder="e.g. A, B"
             />
           </div>
         </div>

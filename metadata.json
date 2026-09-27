@@ -1,6 +1,8 @@
 {
   "name": "Thai Podcast Creator 3.8 Flash Lite TTS",
-  "description": "A professional Text-to-Speech generator specialized for Thai content creation using Gemini 2.5 Pro TTS, supporting multi-speaker podcasts.",
+  "description": "Professional Text-to-Speech & Podcast generator powered by Gemini 3.8 Flash-Lite TTS (Batch 2026) and Gemini 3.8 Flash TTS with Native Two-Speaker Staging, Inline Vocal Expression Tags, and Thai phonetics optimization.",
   "requestFramePermissions": [],
-  "majorCapabilities": []
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }

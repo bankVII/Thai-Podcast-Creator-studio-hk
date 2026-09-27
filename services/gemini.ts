@@ -7,23 +7,252 @@ export function createClient() {
   // Restore the original AI Studio integration: the host handles its selected
   // key. Do not redirect Standard generation through our experimental server.
   // No retryOptions: SDK 1.52 otherwise discards error status/body.
-  return new GoogleGenAI({ apiKey: process.env.API_KEY });
+  return new GoogleGenAI({ apiKey: process.env.API_KEY || process.env.GEMINI_API_KEY });
 }
 
 export function createSession(settings: TtsSettings): PodcastSession {
   return { version: 1, id: crypto.randomUUID(), settings: structuredClone(settings), chunks: splitScript(settings).map(text => ({ text })), charges: [] };
 }
 
+export function lockPodcastTone(userStyle?: string): string {
+  const trimmed = userStyle?.trim() || '';
+  if (!trimmed) {
+    return 'Calm, gentle, mindful podcast host tone, peaceful pacing, soothing, compassionate, and meditative.';
+  }
+  if (!/podcast/i.test(trimmed)) {
+    return `Podcast host style: ${trimmed}`;
+  }
+  return trimmed;
+}
+
+export function formatDialogueParts(
+  settings: TtsSettings,
+  text: string
+): Array<{ text: string; speechMetadata?: { speaker?: string; style?: string }; speech_metadata?: { speaker?: string; style?: string } }> {
+  const isGemini3 = settings.model.startsWith('gemini-3');
+  const style = lockPodcastTone(settings.styleInstructions);
+
+  if (settings.mode !== 'multi') {
+    if (isGemini3) {
+      const meta = { style };
+      return [{
+        text: text.trim() || '...',
+        speechMetadata: meta,
+        speech_metadata: meta,
+      }];
+    }
+    const prompt = `(Speaking Style: ${style}) \n\n${text}`;
+    return [{ text: prompt }];
+  }
+
+  // Gemini 3.8 / 3.x multi-speaker requires each turn to be structured as a separate part
+  // with speech_metadata / speechMetadata containing the configured speaker name.
+  const rawLines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  const speakers = settings.speakers;
+  const primarySpeaker = speakers[0]?.name?.trim() || 'A';
+  const secondarySpeaker = speakers[1]?.name?.trim() || 'B';
+
+  const parts: Array<{ text: string; speechMetadata: { speaker: string; style?: string }; speech_metadata: { speaker: string; style?: string } }> = [];
+  let currentSpeaker = primarySpeaker;
+  let currentLines: string[] = [];
+
+  const flush = () => {
+    if (currentLines.length > 0) {
+      const turnText = currentLines.join('\n').trim();
+      if (turnText) {
+        const meta = {
+          speaker: currentSpeaker,
+          style,
+        };
+        parts.push({
+          text: turnText,
+          speechMetadata: meta,
+          speech_metadata: meta,
+        });
+      }
+      currentLines = [];
+    }
+  };
+
+  const isSpeaker1 = (p: string) => /^(a|1|host\s*[a1]|speaker\s*[a1]|ผู้พูด\s*[a1ก]|พิธีกร\s*[a1ก]|คนที่\s*1|ก|นาย\s*ก|person\s*[a1]|user\s*[a1])$/i.test(p);
+  const isSpeaker2 = (p: string) => /^(b|2|host\s*[b2]|speaker\s*[b2]|ผู้พูด\s*[b2ข]|พิธีกร\s*[b2ข]|คนที่\s*2|ข|นางสาว\s*ข|person\s*[b2]|user\s*[b2])$/i.test(p);
+
+  for (const rawLine of rawLines) {
+    // Strip markdown formatting if it wraps the speaker label (e.g. **A:** or **A**:) and list markers
+    const line = rawLine.replace(/^[-*•]\s+/, '').replace(/^(\*{1,2})([^*]+?)\1/, '$2');
+
+    // Extract speaker prefix using standard ':' or Thai fullwidth '：'
+    const colonIdx = line.search(/[:：]/);
+    let matchedSpeaker: string | null = null;
+    let turnContent = line;
+
+    if (colonIdx >= 0) {
+      const prefix = line.slice(0, colonIdx).replace(/[\[\]\(\)\*]/g, '').trim();
+      const content = line.slice(colonIdx + 1).trim();
+
+      const exact = speakers.find(s => s.name.trim().toLowerCase() === prefix.toLowerCase());
+      if (exact) {
+        matchedSpeaker = exact.name.trim();
+      } else if (isSpeaker1(prefix)) {
+        matchedSpeaker = primarySpeaker;
+      } else if (isSpeaker2(prefix)) {
+        matchedSpeaker = secondarySpeaker;
+      }
+      if (matchedSpeaker) {
+        turnContent = content;
+      }
+    } else {
+      // Bracketed without colon like [A] สวัสดีครับ or (A) สวัสดีครับ or [Speaker A]
+      const bracketMatch = line.match(/^[\[\(]([a-zA-Z0-9_\u0E00-\u0E7F\s]+)[\]\)]\s*(.*)$/);
+      if (bracketMatch) {
+        const prefix = bracketMatch[1].trim();
+        const content = bracketMatch[2].trim();
+        const exact = speakers.find(s => s.name.trim().toLowerCase() === prefix.toLowerCase());
+        if (exact) {
+          matchedSpeaker = exact.name.trim();
+        } else if (isSpeaker1(prefix)) {
+          matchedSpeaker = primarySpeaker;
+        } else if (isSpeaker2(prefix)) {
+          matchedSpeaker = secondarySpeaker;
+        }
+        if (matchedSpeaker) {
+          turnContent = content;
+        }
+      } else {
+        // Dot or dash prefix: A. สวัสดีครับ or 1. สวัสดีครับ or A - สวัสดีครับ
+        const dotMatch = line.match(/^([a-zA-Z0-9_\u0E00-\u0E7F\s]{1,15})[\.\-]\s+(.+)$/);
+        if (dotMatch) {
+          const prefix = dotMatch[1].trim();
+          const content = dotMatch[2].trim();
+          const exact = speakers.find(s => s.name.trim().toLowerCase() === prefix.toLowerCase());
+          if (exact) {
+            matchedSpeaker = exact.name.trim();
+          } else if (isSpeaker1(prefix)) {
+            matchedSpeaker = primarySpeaker;
+          } else if (isSpeaker2(prefix)) {
+            matchedSpeaker = secondarySpeaker;
+          }
+          if (matchedSpeaker) {
+            turnContent = content;
+          }
+        }
+      }
+    }
+
+    if (matchedSpeaker) {
+      if (matchedSpeaker !== currentSpeaker) {
+        flush();
+        currentSpeaker = matchedSpeaker;
+      }
+      if (turnContent) {
+        currentLines.push(turnContent);
+      }
+    } else {
+      currentLines.push(line);
+    }
+  }
+
+  flush();
+
+  if (!parts.length) {
+    const meta = {
+      speaker: primarySpeaker,
+      style,
+    };
+    parts.push({
+      text: text.trim() || '...',
+      speechMetadata: meta,
+      speech_metadata: meta,
+    });
+  }
+
+  return parts;
+}
+
 export function buildRequest(settings: TtsSettings, text: string): InlinedRequest & { contents: NonNullable<InlinedRequest['contents']> } {
-  // Preserve original style/voices. Batch changes scheduling, not direction.
-  const prompt = settings.styleInstructions.trim() ? `(Speaking Style: ${settings.styleInstructions.trim()}) \n\n${text}` : text;
+  const parts = formatDialogueParts(settings, text);
+  const primarySpeaker = settings.speakers[0]?.name?.trim() || 'A';
+  const secondarySpeaker = settings.speakers[1]?.name?.trim() || 'B';
+
+  const isMulti = settings.mode === 'multi';
+  const speakersInChunk = new Set(parts.map(p => p.speechMetadata?.speaker).filter(Boolean));
+
+  let speechConfig: any;
+  let requestParts: Array<{
+    text: string;
+    speechMetadata?: { speaker?: string; style?: string };
+    speech_metadata?: { speaker?: string; style?: string };
+  }>;
+
+  // When in multi mode AND at least 2 distinct speakers are present in this chunk:
+  if (isMulti && speakersInChunk.size >= 2) {
+    speechConfig = {
+      multiSpeakerVoiceConfig: {
+        speakerVoiceConfigs: [
+          {
+            speaker: primarySpeaker,
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: settings.speakers[0]?.voice || 'Sadaltager' } },
+          },
+          {
+            speaker: secondarySpeaker,
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: settings.speakers[1]?.voice || 'Sulafat' } },
+          },
+        ],
+      },
+    };
+
+    // Google multi-speaker API requirement:
+    // Multi-speaker generation requests must specify speaker for each text part in the contents.
+    const podcastStyle = lockPodcastTone(settings.styleInstructions);
+    requestParts = parts.map(p => {
+      const spk = p.speechMetadata?.speaker || primarySpeaker;
+      const cleanText = p.text.replace(/^[A-Za-z0-9_\u0E00-\u0E7F\s]+[:：\.\-]\s*/, '').trim();
+      const textContent = cleanText || p.text.trim() || '...';
+      const meta = {
+        speaker: spk,
+        style: p.speechMetadata?.style || podcastStyle,
+      };
+      return {
+        text: `${spk}: ${textContent}`,
+        speechMetadata: meta,
+        speech_metadata: meta,
+      };
+    });
+  } else {
+    // Single speaker chunk (either settings.mode === 'single' or chunk contains only 1 speaker):
+    // Using single-voice voiceConfig guarantees Google will NEVER throw "must specify speaker names"
+    const activeSpeaker = [...speakersInChunk][0] || primarySpeaker;
+    const speakerConfig =
+      settings.speakers.find(s => s.name.trim().toLowerCase() === activeSpeaker.toLowerCase()) ||
+      settings.speakers[0];
+    const voiceName = speakerConfig?.voice || settings.speakers[0]?.voice || 'Sadaltager';
+
+    speechConfig = {
+      voiceConfig: { prebuiltVoiceConfig: { voiceName } },
+    };
+
+    const podcastStyle = lockPodcastTone(settings.styleInstructions);
+    const meta = {
+      style: podcastStyle,
+    };
+    requestParts = parts.map(p => {
+      const cleanText = p.text.replace(/^[A-Za-z0-9_\u0E00-\u0E7F\s]+[:：\.\-]\s*/, '').trim();
+      return {
+        text: cleanText || p.text.trim() || '...',
+        speechMetadata: meta,
+        speech_metadata: meta,
+      };
+    });
+  }
+
+  // NOTE: Gemini TTS models (gemini-3.8-flash-tts and gemini-3.8-flash-lite-tts) do NOT accept
+  // systemInstruction. Passing systemInstruction causes Google to return 400 INVALID_ARGUMENT.
+  // Turn-level tone/style belongs in speechMetadata.style / speech_metadata.style.
   return {
-    contents: [{ role: 'user', parts: [{ text: prompt }] }],
+    contents: [{ role: 'user', parts: requestParts as any }],
     config: {
       responseModalities: [Modality.AUDIO],
-      speechConfig: settings.mode === 'multi' ? {
-        multiSpeakerVoiceConfig: { speakerVoiceConfigs: settings.speakers.map(s => ({ speaker: s.name.trim(), voiceConfig: { prebuiltVoiceConfig: { voiceName: s.voice } } })) }
-      } : { voiceConfig: { prebuiltVoiceConfig: { voiceName: settings.speakers[0].voice } } },
+      speechConfig,
     },
   };
 }
@@ -39,10 +268,50 @@ export function decodeResponse(response: GenerateContentResponse): Pick<AudioChu
 
 export function errorMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : typeof error === 'string' ? error : 'เกิดข้อผิดพลาดจาก API';
+  if (message.startsWith('ช่วง ') && message.includes(': ')) {
+    return message;
+  }
   try {
-    const detail = JSON.parse(message)?.error;
-    if (detail?.message) return `Google API ${detail.code ?? ''}: ${detail.message}`;
+    const parsed = JSON.parse(message);
+    const detail = parsed?.error || parsed;
+    if (detail?.message) {
+      if (detail.status === 'INVALID_ARGUMENT' || detail.code === 400) {
+        if (/Speech metadata is not supported/i.test(detail.message)) {
+          return 'โมเดลนี้ไม่รองรับระบบ 2 ผู้พูด: กรุณาสลับโมเดลเป็น Gemini 3.8 Flash TTS (Flagship Audio) สำหรับบทสนทนา 2 ผู้พูด';
+        }
+        if (/must specify.*speaker/i.test(detail.message) || /speaker_voice_configs/i.test(detail.message) || /speaker names/i.test(detail.message) || /speech_metadata/i.test(detail.message)) {
+          return 'รูปแบบบทพูดไม่ถูกต้อง: ต้องระบุผู้พูด A: หรือ B: ให้ชัดเจนในแต่ละท่อน หรือสลับเป็นโมเดล Gemini 3.8 Flash TTS';
+        }
+        if (/Request contains an invalid argument/i.test(detail.message)) {
+          return 'รูปแบบคำขอไม่ถูกต้อง: ตรวจสอบการระบุผู้พูด A: และ B: ในบทสนทนา หรือสลับเป็นโหมดเสียงเดี่ยว / สลับโมเดลเป็น Gemini 3.8 Flash TTS';
+        }
+        return `รูปแบบคำขอไม่ถูกต้อง (Invalid Argument): ${detail.message}`;
+      }
+      if (detail.status === 'FAILED_PRECONDITION' || /precondition/i.test(detail.message)) {
+        return 'ฟังก์ชัน Batch API ยังไม่เปิดให้บริการในบัญชี/ภูมิภาคนี้ — แนะนำให้ใช้ปุ่ม "สร้างเสียงทันที" แทนครับ';
+      }
+      if (detail.status === 'RESOURCE_EXHAUSTED' || detail.code === 429) {
+        return 'โควตาคำขอฟรีชั่วคราวเต็ม (กรุณารอประมาณ 30-60 วินาที หรือสลับคีย์ API)';
+      }
+      return `Google API ${detail.code ?? ''}: ${detail.message}`;
+    }
   } catch { /* Plain text errors are already readable. */ }
+
+  if (/Speech metadata is not supported/i.test(message)) {
+    return 'โมเดลนี้ไม่รองรับระบบ 2 ผู้พูด: กรุณาสลับโมเดลเป็น Gemini 3.8 Flash TTS (Flagship Audio) สำหรับบทสนทนา 2 ผู้พูด';
+  }
+  if (/must specify.*speaker/i.test(message) || /speaker_voice_configs/i.test(message) || /speaker names/i.test(message) || /speech_metadata/i.test(message)) {
+    return 'รูปแบบบทพูดไม่ถูกต้อง: ต้องระบุผู้พูด A: หรือ B: ให้ชัดเจนในแต่ละท่อน หรือสลับเป็นโมเดล Gemini 3.8 Flash TTS';
+  }
+  if (/Precondition check failed/i.test(message)) {
+    return 'ฟังก์ชัน Batch API ยังไม่เปิดให้บริการในบัญชีนี้ — แนะนำให้ใช้ปุ่ม "สร้างเสียงทันที" แทนครับ';
+  }
+  if (/quota|resource_exhausted|429/i.test(message)) {
+    return 'โควตาคำขอฟรีชั่วคราวเต็ม (กรุณารอประมาณ 30-60 วินาที แล้วลองใหม่อีกครั้ง)';
+  }
+  if (/Request contains an invalid argument/i.test(message)) {
+    return 'รูปแบบคำขอไม่ถูกต้อง: ตรวจสอบการระบุผู้พูด A: และ B: ในบทสนทนา หรือสลับเป็นโหมดเสียงเดี่ยว / สลับโมเดลเป็น Gemini 3.8 Flash TTS';
+  }
   return message;
 }
 
@@ -105,6 +374,46 @@ export function batchActive(session?: PodcastSession | null): boolean {
 type Save = (session: PodcastSession) => Promise<void>;
 type Client = Pick<GoogleGenAI, 'models' | 'batches'>;
 
+export async function executeGenerateContent(
+  client: GoogleGenAI | Client,
+  model: string,
+  request: InlinedRequest & { contents: NonNullable<InlinedRequest['contents']> }
+): Promise<GenerateContentResponse> {
+  let effectiveModel = model;
+  // gemini-3.8-flash-lite-tts is strictly for single-speaker TTS.
+  // When multi-speaker voice configuration is present, automatically route to the flagship multi-speaker model gemini-3.8-flash-tts.
+  const speechConfig = request.config?.speechConfig as any;
+  if (speechConfig?.multiSpeakerVoiceConfig && effectiveModel === 'gemini-3.8-flash-lite-tts') {
+    effectiveModel = 'gemini-3.8-flash-tts';
+  }
+
+  const anyClient = client as any;
+  const apiClient = anyClient.apiClient || anyClient.models?.apiClient;
+  // Always prefer apiClient.request when available because @google/genai's partToMldev serializer
+  // strips speechMetadata/speech_metadata from contents parts.
+  if (apiClient?.request) {
+    const payload: any = {
+      contents: request.contents,
+      generationConfig: {
+        responseModalities: ['AUDIO'],
+        speechConfig: request.config?.speechConfig,
+      },
+    };
+    const response = await apiClient.request({
+      path: `models/${effectiveModel}:generateContent`,
+      httpMethod: 'POST',
+      body: JSON.stringify(payload),
+      httpOptions: { headers: { 'Content-Type': 'application/json' } },
+    });
+    const data = await response.json();
+    if (data.error) {
+      throw new Error(JSON.stringify(data));
+    }
+    return data as GenerateContentResponse;
+  }
+  return await client.models.generateContent({ model: effectiveModel, ...request });
+}
+
 export async function generateStandard(session: PodcastSession, save: Save, status: (s: string) => void, options: { replaceIndex?: number; shouldStop?: () => boolean; client?: Client } = {}) {
   if (batchActive(session)) throw new Error('มีงาน Batch ค้างอยู่ กรุณาตรวจสถานะก่อน');
   if (options.replaceIndex !== undefined && session.chunks[options.replaceIndex]?.shortRepair) throw new Error('มีการซ่อมช่วงสั้นค้างอยู่ กรุณากดซ่อมแบบช่วงสั้นต่อ');
@@ -115,7 +424,7 @@ export async function generateStandard(session: PodcastSession, save: Save, stat
     if (options.shouldStop?.()) break;
     status(`กำลังสร้างช่วง ${index + 1}/${session.chunks.length}`);
     try {
-      const response = await withRetry(() => client.models.generateContent({ model: session.settings.model, ...buildRequest(session.settings, session.chunks[index].text) }), status);
+      const response = await withRetry(() => executeGenerateContent(client, session.settings.model, buildRequest(session.settings, session.chunks[index].text)), status);
       charge(session, response, 'standard');
       const audio = decodeResponse(response);
       session.charges[session.charges.length - 1].seconds = audio.seconds;
@@ -169,46 +478,231 @@ export function restorePreviousTake(session: PodcastSession, index: number) {
 
 export async function submitBatch(session: PodcastSession, save: Save, client: Client = createClient()) {
   if (batchActive(session)) throw new Error('มี Batch ค้างอยู่แล้ว');
+  // Clear any stale batch record
+  delete session.batch;
+
+  let effectiveModel = session.settings.model;
+  if (effectiveModel === 'gemini-3.8-flash-lite-tts' && session.settings.mode === 'multi') {
+    effectiveModel = 'gemini-3.8-flash-tts';
+  }
+
   const indices = session.chunks.map((_, i) => i).filter(i => !session.chunks[i].pcm);
-  if (!indices.length) return;
-  await checkBatchConnection(session.settings.model, client);
+  if (!indices.length) throw new Error('ทุกช่วงเสียงถูกสร้างเสร็จหมดแล้ว หากต้องการสร้างใหม่กรุณากดปุ่มล้างไฟล์เสียงก่อน');
+  await checkBatchConnection(effectiveModel, client);
   const src = indices.map(i => ({ ...buildRequest(session.settings, session.chunks[i].text), metadata: { key: `${session.id}:${i}` } }));
   if (new TextEncoder().encode(JSON.stringify(src)).length > 19_000_000) throw new Error('บทใหญ่เกินขนาด Inline Batch กรุณาแบ่งเป็นหลายตอน');
-  session.batch = { displayName: `podcast-${session.id}-${Date.now()}`, state: 'SUBMITTING', indices };
+  session.batch = {
+    displayName: `podcast-${session.id}-${Date.now()}`,
+    state: 'SUBMITTING',
+    indices,
+    lastChecked: new Date().toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+    checkMessage: 'กำลังส่งคำขอเข้าคิว Batch ของ Google...',
+  };
   await save(session);
-  let job: BatchJob;
+  let job: any;
   try {
-    job = await client.batches.create({ model: session.settings.model, src, config: { displayName: session.batch.displayName } });
+    const anyClient = client as any;
+    const apiClient = anyClient.apiClient || anyClient.batches?.apiClient;
+    if (apiClient?.request) {
+      const batchPayload = {
+        batch: {
+          displayName: session.batch.displayName,
+          inputConfig: {
+            requests: {
+              requests: src.map(item => ({
+                request: {
+                  contents: item.contents,
+                  generationConfig: {
+                    responseModalities: ['AUDIO'],
+                    speechConfig: item.config?.speechConfig,
+                  },
+                },
+                metadata: item.metadata,
+              })),
+            },
+          },
+        },
+      };
+      const response = await apiClient.request({
+        path: `models/${effectiveModel}:batchGenerateContent`,
+        httpMethod: 'POST',
+        body: JSON.stringify(batchPayload),
+        httpOptions: { headers: { 'Content-Type': 'application/json' } },
+      });
+      const data = await response.json();
+      if (data.error) throw new Error(JSON.stringify(data));
+      job = data;
+    } else {
+      job = await client.batches.create({ model: effectiveModel, src, config: { displayName: session.batch.displayName } });
+    }
   } catch (error) {
     session.batch.state = [400, 401, 403, 404, 405, 413, 422, 429].includes(statusCode(error)!) ? 'JOB_STATE_FAILED' : 'SUBMISSION_UNKNOWN';
     session.batch.lastError = errorMessage(error);
     await save(session);
     throw error;
   }
-  if (!job.name) throw new Error('API ไม่ส่งหมายเลขงานกลับมา กรุณากดค้นหางานที่ส่งไปแล้ว');
-  session.batch.name = job.name;
-  // Mark terminal only after importing results, including immediate completion.
-  session.batch.state = 'JOB_STATE_PENDING';
+  const jobName = job?.name || (job as any)?.metadata?.name;
+  if (!jobName) throw new Error('API ไม่ส่งหมายเลขงานกลับมา กรุณากดค้นหางานที่ส่งไปแล้ว');
+  session.batch.name = jobName;
+  session.batch.state = (job.state as any) || (job.metadata?.state as any) || 'JOB_STATE_PENDING';
+  session.batch.lastChecked = new Date().toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  session.batch.checkMessage = 'งานถูกส่งเข้าคิว Google สำเร็จแล้ว (JOB_STATE_PENDING) — ระบบ Batch อาจใช้เวลา 10-30 นาทีขึ้นไปตามคิวเซิร์ฟเวอร์ หากต้องการเสียงทันทีสามารถกดยกเลิกคิวแล้วกดสร้างทันทีได้ตลอดเวลา';
   await save(session);
 }
 
-export async function collectBatch(session: PodcastSession, save: Save, client: Client = createClient()) {
+function normalizeBatchJob(raw: any): any {
+  if (!raw) return null;
+  const state = raw.state || raw.metadata?.state || raw.status;
+  const dest =
+    raw.dest ||
+    (raw.metadata?.output ? { inlinedResponses: raw.metadata.output.inlinedResponses || raw.metadata.output.inlined_responses } : undefined) ||
+    (raw.output ? { inlinedResponses: raw.output.inlinedResponses || raw.output.inlined_responses } : undefined) ||
+    (raw.inlinedResponses ? { inlinedResponses: raw.inlinedResponses } : undefined);
+  const error = raw.error || raw.metadata?.error;
+  return {
+    name: raw.name,
+    displayName: raw.displayName || raw.metadata?.displayName,
+    state,
+    dest,
+    error,
+    createTime: raw.createTime || raw.metadata?.createTime,
+    raw,
+  };
+}
+
+async function fetchBatchJobWithFallback(batchName: string, client: Client): Promise<any> {
+  const cleanName = batchName.replace(/^\/?/, '');
+  const anyClient = client as any;
+  const apiKey =
+    anyClient?.apiKey ||
+    anyClient?.clientOptions?.apiKey ||
+    anyClient?.batches?.apiClient?.clientOptions?.apiKey ||
+    process.env.API_KEY ||
+    process.env.GEMINI_API_KEY ||
+    '';
+
+  // 1. Try SDK get first
+  try {
+    const sdkJob = await client.batches.get({ name: batchName });
+    if (sdkJob) return normalizeBatchJob(sdkJob);
+  } catch (sdkErr) {
+    const msg = errorMessage(sdkErr);
+    // If it's not a streaming/ReadableStream bug and we have no direct API key, rethrow
+    if (!/readable|close|json|stream/i.test(msg) && !apiKey) {
+      throw sdkErr;
+    }
+  }
+
+  // 2. Direct REST fetch with text parsing (bypasses browser stream closing issues)
+  if (apiKey) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/${cleanName}?key=${encodeURIComponent(apiKey)}`;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        if (attempt > 0) {
+          await new Promise(r => setTimeout(r, 1000 * attempt));
+        }
+        const res = await fetch(url, {
+          method: 'GET',
+          headers: {
+            Accept: 'application/json',
+          },
+        });
+
+        const text = await res.text();
+        if (!text || text.trim().length === 0) {
+          if (attempt < 2) continue;
+          throw new Error('Google ส่งข้อมูลว่างเปล่า (การเชื่อมต่ออาจหยุดชะงักชั่วคราว)');
+        }
+
+        let data: any;
+        try {
+          data = JSON.parse(text);
+        } catch {
+          if (attempt < 2) continue;
+          throw new Error('การแปลงข้อมูล JSON จาก Google ขัดข้องชั่วคราว');
+        }
+
+        if (data.error) {
+          throw new Error(JSON.stringify(data));
+        }
+
+        return normalizeBatchJob(data);
+      } catch (err) {
+        if (attempt === 2) throw err;
+      }
+    }
+  }
+
+  // Fallback
+  const fallbackJob = await client.batches.get({ name: batchName });
+  return normalizeBatchJob(fallbackJob);
+}
+
+export async function collectBatch(session: PodcastSession, save: Save, client: Client = createClient()): Promise<string> {
   const batch = session.batch;
   if (!batch) throw new Error('ไม่มีงาน Batch');
-  if (!batchActive(session)) return;
+  if (!batchActive(session)) return 'งานนี้เสร็จสิ้นหรือถูกยกเลิกแล้ว';
+  const nowStr = new Date().toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  batch.lastChecked = nowStr;
+
   if (!batch.name) {
-    const jobs = await client.batches.list({ config: { pageSize: 100 } });
-    for await (const job of jobs) {
-      if (job.displayName === batch.displayName && job.name) { batch.name = job.name; break; }
+    try {
+      const jobs = await client.batches.list({ config: { pageSize: 100 } });
+      for await (const job of jobs) {
+        if (job.displayName === batch.displayName && job.name) { batch.name = job.name; break; }
+      }
+    } catch (e) {
+      batch.lastError = errorMessage(e);
+      await save(session);
+      throw e;
     }
-    if (!batch.name) throw new Error('ยังไม่พบงานที่ส่งไปแล้ว รอสักครู่แล้วค้นหาอีกครั้ง ห้ามส่งซ้ำจนยืนยันสถานะจาก Google ได้');
+    if (!batch.name) {
+      batch.checkMessage = `ตรวจเวลา ${nowStr}: ยังไม่พบงานในระบบ Google กรุณารอสักครู่`;
+      await save(session);
+      throw new Error('ยังไม่พบงานที่ส่งไปแล้ว รอสักครู่แล้วค้นหาอีกครั้ง หรือกดยกเลิกเพื่อสลับไปสร้างทันที');
+    }
     await save(session);
   }
-  const job = await client.batches.get({ name: batch.name });
-  const terminal = ['JOB_STATE_SUCCEEDED', 'JOB_STATE_FAILED', 'JOB_STATE_CANCELLED', 'JOB_STATE_EXPIRED'].includes(job.state ?? '');
+
+  let job: any;
+  try {
+    job = await fetchBatchJobWithFallback(batch.name, client);
+    // Success: clear transient error if any was stored previously
+    batch.lastError = undefined;
+  } catch (error) {
+    const errText = errorMessage(error);
+    if (/not_found|404|entity was not found/i.test(errText)) {
+      // In the first 1-2 minutes, Google Batch API may return 404 while propagating across datacenters.
+      // NEVER cancel the batch automatically! Keep state and wait for next poll.
+      batch.lastError = undefined;
+      batch.checkMessage = `ตรวจเวลา ${nowStr}: Google กำลังเริ่มต้นจัดเตรียมงานในระบบคลาวด์ (JOB_STATE_PENDING)...`;
+      await save(session);
+      return batch.checkMessage;
+    }
+
+    // For transient network / stream / JSON parse glitches:
+    // DO NOT fail the batch and DO NOT throw a fatal error!
+    batch.lastError = undefined;
+    batch.checkMessage = `ตรวจเวลา ${nowStr}: กำลังรอการเชื่อมต่อกับ Google (${errText}) — งานในคิวยังคงประมวลผลอยู่ตามปกติ`;
+    await save(session);
+    return batch.checkMessage;
+  }
+
+  const jobState = job?.state || batch.state;
+  const terminal = ['JOB_STATE_SUCCEEDED', 'JOB_STATE_FAILED', 'JOB_STATE_CANCELLED', 'JOB_STATE_EXPIRED'].includes(jobState);
   if (terminal) {
-    const rows = job.dest?.inlinedResponses;
-    if (job.state === 'JOB_STATE_SUCCEEDED' && !rows) throw new Error('งานสำเร็จแต่ยังไม่พบ Inline results กรุณาตรวจอีกครั้ง');
+    const rows =
+      job.dest?.inlinedResponses ||
+      job.dest?.inlined_responses ||
+      job.output?.inlinedResponses ||
+      job.output?.inlined_responses ||
+      job.inlinedResponses;
+
+    if (jobState === 'JOB_STATE_SUCCEEDED' && !rows) {
+      batch.checkMessage = `ตรวจเวลา ${nowStr}: Google เรนเดอร์เสียงเสร็จแล้ว กำลังรอรับข้อมูลไฟล์เสียง...`;
+      await save(session);
+      return batch.checkMessage;
+    }
     const results = rows ?? [];
     for (let position = 0; position < batch.indices.length; position++) {
       const index = batch.indices[position];
@@ -216,14 +710,61 @@ export async function collectBatch(session: PodcastSession, save: Save, client: 
       const key = `${session.id}:${index}`;
       const row = results.some(r => r.metadata?.key) ? results.find(r => r.metadata?.key === key) : results[position];
       try {
-        if (!row?.response) throw new Error(row?.error?.message || job.error?.message || 'ไม่มีผลลัพธ์สำหรับช่วงนี้');
-        charge(session, row.response, 'batch');
-        const audio = decodeResponse(row.response);
+        const itemResp = row?.response || row?.generateContentResponse;
+        if (!itemResp) throw new Error(row?.error?.message || job.error?.message || 'ไม่มีผลลัพธ์สำหรับช่วงนี้');
+        charge(session, itemResp, 'batch');
+        const audio = decodeResponse(itemResp);
         session.charges[session.charges.length - 1].seconds = audio.seconds;
         session.chunks[index] = { text: session.chunks[index].text, ...audio };
       } catch (error) { session.chunks[index].error = errorMessage(error); }
     }
   }
-  batch.state = job.state ?? batch.state;
+
+  batch.state = jobState;
+  if (batch.state === 'JOB_STATE_PENDING') {
+    batch.lastError = undefined;
+    batch.checkMessage = `ตรวจเวลา ${nowStr}: งานกำลังรอคิวที่เซิร์ฟเวอร์ Google (JOB_STATE_PENDING) — เนื่องจาก Batch เป็นคิวประหยัด 50% อาจใช้เวลา 10-30 นาทีขึ้นไป หากรีบสามารถกดยกเลิกแล้วกดสร้างทันทีได้`;
+  } else if (batch.state === 'JOB_STATE_RUNNING') {
+    batch.lastError = undefined;
+    batch.checkMessage = `ตรวจเวลา ${nowStr}: Google กำลังประมวลผลเสียง (JOB_STATE_RUNNING)...`;
+  } else if (batch.state === 'JOB_STATE_SUCCEEDED') {
+    batch.lastError = undefined;
+    batch.checkMessage = `ตรวจเวลา ${nowStr}: งานเสร็จสมบูรณ์ รวมไฟล์เสียงเรียบร้อยแล้ว!`;
+  } else if (batch.state === 'JOB_STATE_CANCELLED') {
+    batch.checkMessage = `ตรวจเวลา ${nowStr}: งานถูกยกเลิกแล้ว`;
+  } else if (batch.state === 'JOB_STATE_FAILED') {
+    batch.lastError = job.error?.message || 'ข้อผิดพลาดจาก Google';
+    batch.checkMessage = `ตรวจเวลา ${nowStr}: คิว Batch ล้มเหลว (${batch.lastError}) แนะนำให้ใช้ปุ่มสร้างทันที`;
+  } else {
+    batch.checkMessage = `ตรวจเวลา ${nowStr}: สถานะ ${batch.state}`;
+  }
+
   await save(session);
+  return batch.checkMessage;
+}
+
+export async function cancelBatch(session: PodcastSession, save: Save, client: Client = createClient()) {
+  const batch = session.batch;
+  if (!batch) return;
+  const nowStr = new Date().toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  if (batch.name) {
+    try {
+      const anyClient = client as any;
+      if (anyClient.batches?.cancel) {
+        await anyClient.batches.cancel({ name: batch.name });
+      }
+    } catch {
+      // Best-effort cancel on Google API. Local dismissal always succeeds.
+    }
+  }
+  batch.state = 'JOB_STATE_CANCELLED';
+  batch.checkMessage = `ยกเลิกการรอคิว Batch แล้ว (${nowStr}) — ระบบปลดล็อกแล้ว สามารถกดปุ่ม "สร้างทันที (Real-time)" เพื่อสร้างเสียงได้ทันที`;
+  await save(session);
+}
+
+export async function dismissBatch(session: PodcastSession, save: Save) {
+  if (session.batch) {
+    delete session.batch;
+    await save(session);
+  }
 }

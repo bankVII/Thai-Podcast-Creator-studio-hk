@@ -1,6 +1,6 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
-const models = 'gemini-(?:2\\.5-flash-preview-tts|3\\.1-flash-tts-preview)';
+const models = 'gemini-(?:3\\.8-flash-lite-tts|3\\.8-flash-tts|2\\.5-flash-preview-tts|3\\.1-flash-tts-preview)';
 const allowed = new RegExp(`^/v1beta/(?:models/${models}:(?:generateContent|batchGenerateContent)|batches(?:/[a-zA-Z0-9_-]+)?)$`);
 
 // Runs only in Vite's Node server, never in the client bundle.

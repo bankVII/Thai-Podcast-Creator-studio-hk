@@ -35,7 +35,7 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({ audioBlob, onReset }) 
     if (audioRef.current) {
       audioRef.current.playbackRate = playbackRate;
     }
-  }, [playbackRate]);
+  }, [playbackRate, blobUrl]);
 
   const togglePlay = async () => {
     if (!audioRef.current || !blobUrl) return;
@@ -95,15 +95,17 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({ audioBlob, onReset }) 
 
   return (
     <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6 mt-6 shadow-xl animate-in fade-in slide-in-from-bottom-4 duration-500">
-      <audio
-        ref={audioRef}
-        src={blobUrl || ''}
-        onTimeUpdate={handleTimeUpdate}
-        onLoadedMetadata={handleLoadedMetadata}
-        onEnded={handleEnded}
-        onPlay={() => setIsPlaying(true)}
-        onPause={() => setIsPlaying(false)}
-      />
+      {blobUrl ? (
+        <audio
+          ref={audioRef}
+          src={blobUrl}
+          onTimeUpdate={handleTimeUpdate}
+          onLoadedMetadata={handleLoadedMetadata}
+          onEnded={handleEnded}
+          onPlay={() => setIsPlaying(true)}
+          onPause={() => setIsPlaying(false)}
+        />
+      ) : null}
       
       <div className="flex flex-col gap-4">
         {/* Progress Bar */}

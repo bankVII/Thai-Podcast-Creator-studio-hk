@@ -1,7 +1,75 @@
 import { TtsSettings } from '../types';
 
-// Sentence/word segmentation understands Thai. Grapheme fallback never splits
-// a vowel/mark or surrogate pair; the speaker prefix counts toward the budget.
+export const KNOWN_TAGS = new Set([
+  '[laughter]', '[giggle]', '[snicker]', '[sigh]', '[gasp]',
+  '[whisper]', '[clears throat]', '[cough]', '[yawn]',
+  '[hesitation]', '[hum]', '[excited]',
+  '<breath>', '<laugh>', '<gasp>', '|mhm|', '|yeah|',
+]);
+
+export interface TagAnalysis {
+  tags: { tag: string; count: number; known: boolean }[];
+  totalTags: number;
+  warnings: string[];
+}
+
+export function analyzeInlineTags(text: string): TagAnalysis {
+  const tagRegex = /\[[a-zA-Z0-9_\s-]+\]|<[a-zA-Z0-9_\s-]+>|\|[a-zA-Z0-9_\s-]+\|/g;
+  const counts = new Map<string, number>();
+  let match: RegExpExecArray | null;
+  while ((match = tagRegex.exec(text)) !== null) {
+    const raw = match[0].toLowerCase();
+    counts.set(raw, (counts.get(raw) ?? 0) + 1);
+  }
+
+  const tags = Array.from(counts.entries()).map(([tag, count]) => ({
+    tag,
+    count,
+    known: KNOWN_TAGS.has(tag),
+  }));
+
+  const warnings: string[] = [];
+
+  // Check for potentially unclosed brackets
+  const openBracketWithoutClose = /\[(?![^\]]*\])[^\[\n]{1,40}(?=\n|$)/g;
+  let unclosedMatch: RegExpExecArray | null;
+  while ((unclosedMatch = openBracketWithoutClose.exec(text)) !== null) {
+    warnings.push(`อาจมีแท็กที่ไม่ได้ปิดวงเล็บ: "${unclosedMatch[0]}"`);
+  }
+
+  // Check for common typo variations like [laugh] instead of [laughter]
+  if (text.includes('[laugh]')) warnings.push('พบ "[laugh]" — Gemini 3.8 แนะนำใช้ "[laughter]" สำหรับเสียงหัวเราะเต็มเสียง');
+  if (text.includes('[cry]')) warnings.push('พบ "[cry]" — Gemini 3.8 รองรับแท็กอย่างเป็นทางการ เช่น [laughter], [sigh], [whisper], [gasp]');
+
+  return {
+    tags,
+    totalTags: tags.reduce((acc, t) => acc + t.count, 0),
+    warnings,
+  };
+}
+
+// Tokenize text into words/particles and atomic inline tags so tags are never severed
+function tokenizeWithTags(text: string): string[] {
+  const tokens: string[] = [];
+  // Match inline tags [tag], <tag>, |tag| as atomic tokens
+  const tagPattern = /(\[[a-zA-Z0-9_\s-]+\]|<[a-zA-Z0-9_\s-]+>|\|[a-zA-Z0-9_\s-]+\|)/g;
+  const parts = text.split(tagPattern);
+  const words = new Intl.Segmenter('th', { granularity: 'word' });
+
+  for (const part of parts) {
+    if (!part) continue;
+    if (tagPattern.test(part)) {
+      tokens.push(part);
+    } else {
+      for (const { segment } of words.segment(part)) {
+        if (segment) tokens.push(segment);
+      }
+    }
+  }
+  return tokens;
+}
+
+// Sentence/word segmentation understands Thai and preserves atomic tags.
 function splitText(text: string, budget: number): string[] {
   const result: string[] = [];
   let current = '';
@@ -12,15 +80,21 @@ function splitText(text: string, budget: number): string[] {
     }
     current += part;
   };
-  const words = new Intl.Segmenter('th', { granularity: 'word' });
+
   const graphemes = new Intl.Segmenter('th', { granularity: 'grapheme' });
   for (const { segment: sentence } of new Intl.Segmenter('th', { granularity: 'sentence' }).segment(text)) {
     if (sentence.length <= budget) { add(sentence); continue; }
-    for (const { segment } of words.segment(sentence)) {
-      if (segment.length <= budget) add(segment);
-      else for (const { segment: grapheme } of graphemes.segment(segment)) {
-        if (grapheme.length > budget) throw new Error('ข้อความมีอักขระต่อเนื่องยาวผิดปกติ');
-        add(grapheme);
+    
+    // When sentence is longer than budget, tokenize while preserving inline tags
+    for (const token of tokenizeWithTags(sentence)) {
+      if (token.length <= budget) {
+        add(token);
+      } else {
+        // Fallback for unusually long non-tag tokens
+        for (const { segment: grapheme } of graphemes.segment(token)) {
+          if (grapheme.length > budget) throw new Error('ข้อความมีอักขระต่อเนื่องยาวผิดปกติ');
+          add(grapheme);
+        }
       }
     }
   }
@@ -39,17 +113,86 @@ export function splitScript(settings: TtsSettings): string[] {
   }
   if (settings.styleInstructions.length > 2000) throw new Error('คำกำกับโทนเสียงยาวเกิน 2,000 ตัวอักษร');
   const turns: { speaker: string; text: string }[] = [];
-  for (const line of settings.script.split(/\r?\n/).map(l => l.trim()).filter(Boolean)) {
-    if (mode === 'single') { turns.push({ speaker: '', text: line }); continue; }
-    const colon = line.indexOf(':');
-    const speaker = colon >= 0 ? names.find(n => n.toLowerCase() === line.slice(0, colon).trim().toLowerCase()) : undefined;
-    if (speaker) turns.push({ speaker, text: line.slice(colon + 1).trim() });
-    else {
-      if (colon >= 0 && /^[\p{L}\p{N}_ .-]{1,60}$/u.test(line.slice(0, colon))) {
-        throw new Error(`ไม่รู้จักผู้พูด "${line.slice(0, colon)}" — ใช้ ${names.join(' / ')}`);
+  for (const rawLine of settings.script.split(/\r?\n/).map(l => l.trim()).filter(Boolean)) {
+    if (mode === 'single') {
+      turns.push({ speaker: '', text: rawLine });
+      continue;
+    }
+
+    // Strip markdown formatting if it wraps the speaker label (e.g. **A:** or **A**:) and list markers
+    const line = rawLine.replace(/^[-*•]\s+/, '').replace(/^(\*{1,2})([^*]+?)\1/, '$2');
+
+    // Extract speaker prefix using standard ':' or Thai fullwidth '：'
+    const colonIdx = line.search(/[:：]/);
+    let matchedSpeaker: string | undefined;
+    let turnContent = line;
+
+    const isSpeaker1 = (p: string) => /^(a|1|host\s*[a1]|speaker\s*[a1]|ผู้พูด\s*[a1ก]|พิธีกร\s*[a1ก]|คนที่\s*1|ก|นาย\s*ก|person\s*[a1]|user\s*[a1])$/i.test(p);
+    const isSpeaker2 = (p: string) => /^(b|2|host\s*[b2]|speaker\s*[b2]|ผู้พูด\s*[b2ข]|พิธีกร\s*[b2ข]|คนที่\s*2|ข|นางสาว\s*ข|person\s*[b2]|user\s*[b2])$/i.test(p);
+
+    if (colonIdx >= 0) {
+      const prefix = line.slice(0, colonIdx).replace(/[\[\]\(\)\*]/g, '').trim();
+      const content = line.slice(colonIdx + 1).trim();
+
+      const exact = names.find(n => n.toLowerCase() === prefix.toLowerCase());
+      if (exact) {
+        matchedSpeaker = exact;
+      } else if (isSpeaker1(prefix)) {
+        matchedSpeaker = names[0];
+      } else if (isSpeaker2(prefix)) {
+        matchedSpeaker = names[1];
       }
-      if (!turns.length) throw new Error(`บทพอดแคสต์ต้องเริ่มด้วย ${names[0]}: หรือ ${names[1]}:`);
-      turns[turns.length - 1].text += '\n' + line;
+
+      if (matchedSpeaker) {
+        turnContent = content;
+      }
+    } else {
+      // Bracketed without colon like [A] สวัสดีครับ or (A) สวัสดีครับ or [Speaker A]
+      const bracketMatch = line.match(/^[\[\(]([a-zA-Z0-9_\u0E00-\u0E7F\s]+)[\]\)]\s*(.*)$/);
+      if (bracketMatch) {
+        const prefix = bracketMatch[1].trim();
+        const content = bracketMatch[2].trim();
+        const exact = names.find(n => n.toLowerCase() === prefix.toLowerCase());
+        if (exact) {
+          matchedSpeaker = exact;
+        } else if (isSpeaker1(prefix)) {
+          matchedSpeaker = names[0];
+        } else if (isSpeaker2(prefix)) {
+          matchedSpeaker = names[1];
+        }
+        if (matchedSpeaker) {
+          turnContent = content;
+        }
+      } else {
+        // Dot or dash prefix: A. สวัสดีครับ or 1. สวัสดีครับ or A - สวัสดีครับ
+        const dotMatch = line.match(/^([a-zA-Z0-9_\u0E00-\u0E7F\s]{1,15})[\.\-]\s+(.+)$/);
+        if (dotMatch) {
+          const prefix = dotMatch[1].trim();
+          const content = dotMatch[2].trim();
+          const exact = names.find(n => n.toLowerCase() === prefix.toLowerCase());
+          if (exact) {
+            matchedSpeaker = exact;
+          } else if (isSpeaker1(prefix)) {
+            matchedSpeaker = names[0];
+          } else if (isSpeaker2(prefix)) {
+            matchedSpeaker = names[1];
+          }
+          if (matchedSpeaker) {
+            turnContent = content;
+          }
+        }
+      }
+    }
+
+    if (matchedSpeaker) {
+      turns.push({ speaker: matchedSpeaker, text: turnContent });
+    } else {
+      // Continuation of previous turn or fallback to first speaker
+      if (!turns.length) {
+        turns.push({ speaker: names[0], text: line });
+      } else {
+        turns[turns.length - 1].text += '\n' + line;
+      }
     }
   }
   const chunks: string[] = [];

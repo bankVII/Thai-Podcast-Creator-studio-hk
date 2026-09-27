@@ -19,12 +19,18 @@ export interface SpeakerConfig {
   color: string;
 }
 
+export type TtsModel =
+  | 'gemini-3.8-flash-lite-tts'
+  | 'gemini-3.8-flash-tts'
+  | 'gemini-2.5-flash-preview-tts'
+  | 'gemini-3.1-flash-tts-preview';
+
 export interface TtsSettings {
   mode: 'single' | 'multi';
   speakers: SpeakerConfig[];
   styleInstructions: string;
   script: string;
-  model: 'gemini-2.5-flash-preview-tts' | 'gemini-3.1-flash-tts-preview';
+  model: TtsModel;
   chunkSize: number;
 }
 
@@ -51,6 +57,8 @@ export interface PodcastSession {
     lastError?: string;
     state: string;
     indices: number[];
+    lastChecked?: string;
+    checkMessage?: string;
   };
 }
 
